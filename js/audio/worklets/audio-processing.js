@@ -1,77 +1,114 @@
+import { registeredWorklets } from '../core/worklet-registry.js';
+import { CONFIG } from '../config/config.js';
+
 /**
- * @class AudioProcessingWorklet
- * @extends AudioWorkletProcessor
- * @description Processes incoming audio data, converting it from Float32 to Int16 format and packaging it into chunks.
+ * @class AudioStreamer
+ * @description Manages the playback of audio data, including support for queuing, scheduling, and applying audio effects through worklets.
  */
-class AudioProcessingWorklet extends AudioWorkletProcessor {
+export class AudioStreamer {
     /**
      * @constructor
-     * @description Initializes the buffer for audio processing.
+     * @param {AudioContext} context - The AudioContext instance to use for audio processing.
      */
-    constructor() {
-        super();
-        this.buffer = new Int16Array(2048);
-        this.bufferWriteIndex = 0;
+    constructor(context) {
+        this.context = context;
+        this.audioQueue = [];
+        this.isPlaying = false;
+        this.sampleRate = 24000;    // Default sample rate
+        this.bufferSize = 7680;
+        this.processingBuffer = new Float32Array(0);
+        this.scheduledTime = 0;
+        this.gainNode = this.context.createGain();
+        this.source = this.context.createBufferSource();
+        this.isStreamComplete = false;
+        this.checkInterval = null;
+        this.initialBufferTime = 0.05;
+        this.endOfQueueAudioSource = null;
+        this.onComplete = () => { };
+        this.isInitialized = false;
+        this.gainNode.connect(this.context.destination);
+        this.addPCM16 = this.addPCM16.bind(this);
     }
 
     /**
-     * @method process
-     * @description Processes the audio input data.
-     * @param {Float32Array[][]} inputs - The input audio data.
-     * @returns {boolean} True to keep the worklet alive.
+     * Get the current sample rate
      */
-    process(inputs) {
-        if (inputs[0].length) {
-            const channel0 = inputs[0][0];
-            this.processChunk(channel0);
+    get sampleRate() {
+        return this._sampleRate;
+    }
+
+    /**
+     * Set the sample rate and update buffer size accordingly
+     */
+    set sampleRate(value) {
+        this._sampleRate = value;
+        // Update buffer size based on sample rate to maintain consistent timing
+        this.bufferSize = Math.floor(value * 0.32); // 320ms buffer
+    }
+
+    /**
+     * @method addPCM16
+     * @description Adds a chunk of PCM16 audio data to the streaming queue.
+     * @param {Int16Array} chunk - The audio data chunk.
+     */
+    addPCM16(chunk) {
+        if (!this.isInitialized) {
+            console.warn('AudioStreamer not initialized. Call initialize() first.');
+            return;
         }
-        return true;
-    }
 
-    /**
-     * @method sendAndClearBuffer
-     * @description Sends the current buffer content as a message and resets the buffer.
-     */
-    sendAndClearBuffer() {
-        this.port.postMessage({
-            event: 'chunk',
-            data: {
-                int16arrayBuffer: this.buffer.slice(0, this.bufferWriteIndex).buffer,
-            },
-        });
-        this.bufferWriteIndex = 0;
-    }
+        const float32Array = new Float32Array(chunk.length / 2);
+        const dataView = new DataView(chunk.buffer);
 
-    /**
-     * @method processChunk
-     * @description Processes a chunk of audio data, converting it to Int16 format.
-     * @param {Float32Array} float32Array - The audio data chunk to process.
-     */
-    processChunk(float32Array) {
-        try {
-            const l = float32Array.length;
-
-            for (let i = 0; i < l; i++) {
-                const int16Value = Math.max(-32768, Math.min(32767, Math.floor(float32Array[i] * 32768)));
-                this.buffer[this.bufferWriteIndex++] = int16Value;
-                if (this.bufferWriteIndex >= this.buffer.length) {
-                    this.sendAndClearBuffer();
-                }
+        for (let i = 0; i < chunk.length / 2; i++) {
+            try {
+                const int16 = dataView.getInt16(i * 2, true);
+                float32Array[i] = int16 / 32768;
+            } catch (e) {
+                console.error(e);
             }
+        }
 
-            if (this.bufferWriteIndex >= this.buffer.length) {
-                this.sendAndClearBuffer();
-            }
-        } catch (error) {
-            this.port.postMessage({
-                event: 'error',
-                error: {
-                    message: error.message,
-                    stack: error.stack
-                }
-            });
+        const newBuffer = new Float32Array(this.processingBuffer.length + float32Array.length);
+        newBuffer.set(this.processingBuffer);
+        newBuffer.set(float32Array, this.processingBuffer.length);
+        this.processingBuffer = newBuffer;
+
+        while (this.processingBuffer.length >= this.bufferSize) {
+            const buffer = this.processingBuffer.slice(0, this.bufferSize);
+            this.audioQueue.push(buffer);
+            this.processingBuffer = this.processingBuffer.slice(this.bufferSize);
+        }
+
+        if (!this.isPlaying) {
+            this.isPlaying = true;
+            this.scheduledTime = this.context.currentTime + this.initialBufferTime;
+            this.scheduleNextBuffer();
         }
     }
 }
 
-registerProcessor('audio-recorder-worklet', AudioProcessingWorklet); 
+/**
+ * Google TTS SSML Request with Correct Tagalog Pronunciation
+ */
+const textToSpeechRequest = {
+    input: { ssml: `<speak>
+      <prosody rate="90%" pitch="medium">
+        <sub alias="ee-toh">ITO</sub>
+        <break time="100ms"/>
+        <sub alias="ee-yoh">IYO</sub>
+        <break time="100ms"/>
+        <sub alias="ah-raw">ARAW</sub>
+        <break time="100ms"/>
+        <sub alias="ehh">EH</sub>
+        <break time="100ms"/>
+        <sub alias="mang-ga">MGA</sub>
+        <break time="100ms"/>
+        <sub alias="ah-keen">AKIN</sub>
+        <break time="100ms"/>
+        <sub alias="ah-teen">ATIN</sub>
+      </prosody>
+    </speak>` },
+    voice: { languageCode: "fil-PH", name: "fil-PH-Wavenet-A" },
+    audioConfig: { audioEncoding: "LINEAR16" }
+};
