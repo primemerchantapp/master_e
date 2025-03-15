@@ -30,7 +30,6 @@ export class AudioStreamer {
         this.addPCM16 = this.addPCM16.bind(this);
     }
 
-    
     /**
      * Get the current sample rate
      */
@@ -48,49 +47,11 @@ export class AudioStreamer {
     }
 
     /**
-     * @method addWorklet
-     * @description Adds an audio worklet to the processing pipeline.
-     * @param {string} workletName - The name of the worklet.
-     * @param {string} workletSrc - The source URL of the worklet script.
-     * @param {Function} handler - The message handler function for the worklet.
-     * @returns {Promise<AudioStreamer>} A promise that resolves with the AudioStreamer instance when the worklet is added.
-     * @async
-     */
-    async addWorklet(workletName, workletSrc, handler) {
-        let workletsRecord = registeredWorklets.get(this.context);
-        if (workletsRecord && workletsRecord[workletName]) {
-            workletsRecord[workletName].handlers.push(handler);
-            return Promise.resolve(this);
-        }
-
-        if (!workletsRecord) {
-            registeredWorklets.set(this.context, {});
-            workletsRecord = registeredWorklets.get(this.context);
-        }
-
-        workletsRecord[workletName] = { handlers: [handler] };
-
-        try {
-            const absolutePath = `/${workletSrc}`;
-            await this.context.audioWorklet.addModule(absolutePath);
-        } catch (error) {
-            console.error('Error loading worklet:', error);
-            throw error;
-        }
-        const worklet = new AudioWorkletNode(this.context, workletName);
-
-        workletsRecord[workletName].node = worklet;
-
-        return this;
-    }
-
-    /**
      * @method addPCM16
      * @description Adds a chunk of PCM16 audio data to the streaming queue.
      * @param {Int16Array} chunk - The audio data chunk.
      */
     addPCM16(chunk) {
-
         if (!this.isInitialized) {
             console.warn('AudioStreamer not initialized. Call initialize() first.');
             return;
@@ -125,159 +86,29 @@ export class AudioStreamer {
             this.scheduleNextBuffer();
         }
     }
+}
 
-    /**
-     * @method createAudioBuffer
-     * @description Creates an AudioBuffer from the given audio data.
-     * @param {Float32Array} audioData - The audio data.
-     * @returns {AudioBuffer} The created AudioBuffer.
-     */
-    createAudioBuffer(audioData) {
-        const audioBuffer = this.context.createBuffer(1, audioData.length, this.sampleRate);
-        audioBuffer.getChannelData(0).set(audioData);
-        return audioBuffer;
-    }
-
-    /**
-     * @method scheduleNextBuffer
-     * @description Schedules the next audio buffer for playback.
-     */
-    scheduleNextBuffer() {
-        const SCHEDULE_AHEAD_TIME = 0.2;
-
-        while (this.audioQueue.length > 0 && this.scheduledTime < this.context.currentTime + SCHEDULE_AHEAD_TIME) {
-            const audioData = this.audioQueue.shift();
-            const audioBuffer = this.createAudioBuffer(audioData);
-            const source = this.context.createBufferSource();
-
-            if (this.audioQueue.length === 0) {
-                if (this.endOfQueueAudioSource) {
-                    this.endOfQueueAudioSource.onended = null;
-                }
-                this.endOfQueueAudioSource = source;
-                source.onended = () => {
-                    if (!this.audioQueue.length && this.endOfQueueAudioSource === source) {
-                        this.endOfQueueAudioSource = null;
-                        this.onComplete();
-                    }
-                };
-            }
-
-            source.buffer = audioBuffer;
-            source.connect(this.gainNode);
-
-            const worklets = registeredWorklets.get(this.context);
-
-            if (worklets) {
-                Object.entries(worklets).forEach(([workletName, graph]) => {
-                    const { node, handlers } = graph;
-                    if (node) {
-                        source.connect(node);
-                        node.port.onmessage = function (ev) {
-                            handlers.forEach((handler) => {
-                                handler.call(node.port, ev);
-                            });
-                        };
-                        node.connect(this.context.destination);
-                    }
-                });
-            }
-
-            const startTime = Math.max(this.scheduledTime, this.context.currentTime);
-            source.start(startTime);
-
-            this.scheduledTime = startTime + audioBuffer.duration;
-        }
-
-        if (this.audioQueue.length === 0 && this.processingBuffer.length === 0) {
-            if (this.isStreamComplete) {
-                this.isPlaying = false;
-                if (this.checkInterval) {
-                    clearInterval(this.checkInterval);
-                    this.checkInterval = null;
-                }
-            } else {
-                if (!this.checkInterval) {
-                    this.checkInterval = window.setInterval(() => {
-                        if (this.audioQueue.length > 0 || this.processingBuffer.length >= this.bufferSize) {
-                            this.scheduleNextBuffer();
-                        }
-                    }, 100);
-                }
-            }
-        } else {
-            const nextCheckTime = (this.scheduledTime - this.context.currentTime) * 1000;
-            setTimeout(() => this.scheduleNextBuffer(), Math.max(0, nextCheckTime - 50));
-        }
-    }
-
-    /**
-     * @method stop
-     * @description Stops the audio stream.
-     */
-    stop() {
-        this.isPlaying = false;
-        this.isStreamComplete = true;
-        this.audioQueue = [];
-        this.processingBuffer = new Float32Array(0);
-        this.scheduledTime = this.context.currentTime;
-
-        if (this.checkInterval) {
-            clearInterval(this.checkInterval);
-            this.checkInterval = null;
-        }
-
-        this.gainNode.gain.linearRampToValueAtTime(0, this.context.currentTime + 0.1);
-
-        setTimeout(() => {
-            this.gainNode.disconnect();
-            this.gainNode = this.context.createGain();
-            this.gainNode.connect(this.context.destination);
-        }, 200);
-    }
-
-    /**
-     * @method resume
-     * @description Resumes the audio stream if the AudioContext was suspended.
-     * @async
-     */
-    async resume() {
-        if (this.context.state === 'suspended') {
-            await this.context.resume();
-        }
-        this.isStreamComplete = false;
-        this.scheduledTime = this.context.currentTime + this.initialBufferTime;
-        this.gainNode.gain.setValueAtTime(1, this.context.currentTime);
-    }
-
-    /**
-     * @method complete
-     * @description Marks the audio stream as complete and schedules any remaining data in the buffer.
-     */
-    complete() {
-        this.isStreamComplete = true;
-        if (this.processingBuffer.length > 0) {
-            this.audioQueue.push(this.processingBuffer);
-            this.processingBuffer = new Float32Array(0);
-            if (this.isPlaying) {
-                this.scheduleNextBuffer();
-            }
-        } else {
-            this.onComplete();
-        }
-    }
-
-    /**
-     * @method initialize
-     * @description Initializes the AudioStreamer instance.
-     * @returns {Promise<AudioStreamer>} A promise that resolves with the AudioStreamer instance when initialization is complete.
-     * @async
-     */
-    async initialize() {
-        if (this.context.state === 'suspended') {
-            await this.context.resume();
-        }
-        this.isInitialized = true;
-        return this;
-    }
-} 
+/**
+ * Google TTS SSML Request with Correct Tagalog Pronunciation
+ */
+const textToSpeechRequest = {
+    input: { ssml: `<speak>
+      <prosody rate="90%" pitch="medium">
+        <phoneme alphabet="ipa" ph="i.to">ITO</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="i.jo">IYO</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="a.ɾaw">ARAW</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="ɛh">EH</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="ma.ŋa">MGA</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="a.kin">AKIN</phoneme>
+        <break time="100ms"/>
+        <phoneme alphabet="ipa" ph="a.tin">ATIN</phoneme>
+      </prosody>
+    </speak>` },
+    voice: { languageCode: "fil-PH", name: "fil-PH-Wavenet-A" },
+    audioConfig: { audioEncoding: "LINEAR16" }
+};
